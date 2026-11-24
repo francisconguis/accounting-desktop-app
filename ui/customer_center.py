@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -32,7 +33,309 @@ from accounting.money import (
     parse_money_to_cents,
     parse_rate_to_micros,
 )
+from accounting.reports import FinancialReports
 from ui.styles import make_readonly_item, show_error, show_info, style_table_defaults
+
+
+class InvoiceDetailDialog(QDialog):
+    """Modal viewer showing full line items, applied payments, FIFO COGS, and PDF export for an Invoice."""
+
+    def __init__(
+        self,
+        engine: AccountingEngine,
+        invoice_txn_id: int,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.engine = engine
+        self.details = engine.get_invoice_details(invoice_txn_id)
+        self.setWindowTitle(f"Invoice {self.details['txn_number']} — {self.details['customer_name']}")
+        self.resize(760, 560)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        d = self.details
+        ccy = d["currency_code"]
+        home = self.engine.get_home_currency()
+
+        layout = QVBoxLayout(self)
+
+        # Header summary
+        hdr = QLabel(f"Invoice {d['txn_number']}  ({d['status']})")
+        hdr.setStyleSheet("font-size: 16px; font-weight: 700; color: #1a365d;")
+        layout.addWidget(hdr)
+
+        info_row = QHBoxLayout()
+        f1 = QFormLayout()
+        f2 = QFormLayout()
+        f1.addRow("Customer:", QLabel(f"{d['customer_name']} ({d['customer_company'] or '-'})"))
+        f1.addRow("Invoice Date:", QLabel(d["txn_date"]))
+        f1.addRow("Due Date:", QLabel(d["due_date"] or "-"))
+        f2.addRow("Currency / Rate:", QLabel(f"{ccy} @ {format_rate(d['exchange_rate_micros'])}"))
+        f2.addRow("Memo:", QLabel(d["memo"] or "-"))
+        f2.addRow("FIFO COGS (Home):", QLabel(format_money(d["fifo_cogs_home"], home)))
+        info_row.addLayout(f1)
+        info_row.addLayout(f2)
+        layout.addLayout(info_row)
+
+        # Line items table
+        layout.addWidget(QLabel("Line Items:"))
+        lines_table = QTableWidget(len(d["lines"]), 6)
+        lines_table.setHorizontalHeaderLabels(
+            ["SKU", "Description", "Qty", f"Rate ({ccy})", f"Amount ({ccy})", f"Amount ({home})"]
+        )
+        style_table_defaults(lines_table)
+        for idx, ln in enumerate(d["lines"]):
+            lines_table.setItem(idx, 0, make_readonly_item(ln["item_sku"] or "-"))
+            lines_table.setItem(idx, 1, make_readonly_item(ln["description"] or ln["item_name"] or ""))
+            lines_table.setItem(idx, 2, make_readonly_item(str(ln["quantity"]), align_right=True))
+            lines_table.setItem(idx, 3, make_readonly_item(format_money(ln["rate_foreign"], ccy), align_right=True))
+            lines_table.setItem(idx, 4, make_readonly_item(format_money(ln["amount_foreign"], ccy), align_right=True))
+            lines_table.setItem(idx, 5, make_readonly_item(format_money(ln["amount_home"], home), align_right=True))
+        lines_table.resizeColumnsToContents()
+        layout.addWidget(lines_table)
+
+        # Applied payments table
+        layout.addWidget(QLabel("Applied Payments:"))
+        pay_table = QTableWidget(len(d["payments"]), 5)
+        pay_table.setHorizontalHeaderLabels(
+            ["Payment #", "Date", f"Applied ({ccy})", f"Cash Received ({home})", f"Realized FX ({home})"]
+        )
+        style_table_defaults(pay_table)
+        for idx, p in enumerate(d["payments"]):
+            pay_table.setItem(idx, 0, make_readonly_item(p["payment_number"]))
+            pay_table.setItem(idx, 1, make_readonly_item(p["payment_date"]))
+            pay_table.setItem(idx, 2, make_readonly_item(format_money(p["applied_foreign"], ccy), align_right=True))
+            pay_table.setItem(idx, 3, make_readonly_item(format_money(p["payment_home_amount"], home), align_right=True))
+            fx = int(p["fx_gain_loss_home"])
+            fx_str = f"+{format_money(fx, home)}" if fx > 0 else format_money(fx, home)
+            pay_table.setItem(idx, 4, make_readonly_item(fx_str, align_right=True))
+        pay_table.resizeColumnsToContents()
+        layout.addWidget(pay_table)
+
+        # Totals + Buttons
+        totals_lbl = QLabel(
+            f"Total: {format_money(d['total_foreign'], ccy)} ({format_money(d['total_home'], home)})   |   "
+            f"Paid: {format_money(d['paid_foreign'], ccy)}   |   "
+            f"Balance Due: {format_money(d['open_foreign'], ccy)}"
+        )
+        totals_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #1a365d;")
+        layout.addWidget(totals_lbl)
+
+        btn_row = QHBoxLayout()
+        pdf_btn = QPushButton("Save Invoice as PDF")
+        pdf_btn.setProperty("class", "SuccessButton")
+        pdf_btn.clicked.connect(self._export_pdf)
+        btn_row.addWidget(pdf_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _export_pdf(self) -> None:
+        d = self.details
+        ccy = d["currency_code"]
+        home = self.engine.get_home_currency()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Invoice PDF", f"{d['txn_number']}.pdf", "PDF Files (*.pdf)"
+        )
+        if not path:
+            return
+        rows = [
+            [
+                ln["item_sku"] or "-",
+                ln["description"] or ln["item_name"] or "",
+                str(ln["quantity"]),
+                format_money(ln["rate_foreign"], ccy),
+                format_money(ln["amount_foreign"], ccy),
+            ]
+            for ln in d["lines"]
+        ]
+        rows.append(["", "TOTAL", "", "", format_money(d["total_foreign"], ccy)])
+        rows.append(["", "PAID", "", "", format_money(d["paid_foreign"], ccy)])
+        rows.append(["", "BALANCE DUE", "", "", format_money(d["open_foreign"], ccy)])
+
+        report_dict = {
+            "title": f"INVOICE {d['txn_number']} ({d['status']})",
+            "subtitle": f"Customer: {d['customer_name']}  |  Date: {d['txn_date']}  |  Due: {d['due_date'] or '-'}  |  Home Equiv: {format_money(d['total_home'], home)}",
+            "headers": ["SKU", "Description", "Qty", f"Rate ({ccy})", f"Amount ({ccy})"],
+            "rows": rows,
+        }
+        try:
+            company = self.engine.get_company_settings()["company_name"]
+            FinancialReports.export_to_pdf(report_dict, path, company_name=company)
+            show_info(self, "PDF Saved", f"Invoice PDF saved to:\n{path}")
+        except Exception as exc:
+            show_error(self, "PDF Error", str(exc))
+
+
+class CustomerInvoicesView(QWidget):
+    """Dedicated screen to view and filter all invoices made for a specific customer."""
+
+    def __init__(
+        self,
+        engine: AccountingEngine,
+        open_action: Callable[[str], None],
+        on_data_changed: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.engine = engine
+        self.open_action = open_action
+        self.on_data_changed = on_data_changed
+        self._invoices: list[dict[str, Any]] = []
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        hdr = QLabel("Customer Invoices")
+        hdr.setStyleSheet("font-size: 16px; font-weight: 700; color: #1a365d;")
+        top.addWidget(hdr)
+        top.addStretch()
+
+        new_inv_btn = QPushButton("+ Create Invoice")
+        new_inv_btn.setProperty("class", "PrimaryButton")
+        new_inv_btn.clicked.connect(lambda: self.open_action("create_invoice"))
+        top.addWidget(new_inv_btn)
+
+        pay_btn = QPushButton("Receive Payment")
+        pay_btn.clicked.connect(lambda: self.open_action("receive_payments"))
+        top.addWidget(pay_btn)
+        layout.addLayout(top)
+
+        # Filter bar
+        filt = QHBoxLayout()
+        filt.addWidget(QLabel("Customer:"))
+        self.customer_combo = QComboBox()
+        self.customer_combo.setMinimumWidth(240)
+        self.customer_combo.currentIndexChanged.connect(self._load_invoices)
+        filt.addWidget(self.customer_combo)
+
+        filt.addWidget(QLabel("Status:"))
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["All", "Open", "Partial", "Paid", "Void"])
+        self.status_combo.currentIndexChanged.connect(self._load_invoices)
+        filt.addWidget(self.status_combo)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        filt.addWidget(refresh_btn)
+        filt.addStretch()
+
+        view_btn = QPushButton("View Invoice Details")
+        view_btn.setProperty("class", "SuccessButton")
+        view_btn.clicked.connect(self._view_selected)
+        filt.addWidget(view_btn)
+
+        void_btn = QPushButton("Void Invoice")
+        void_btn.clicked.connect(self._void_selected)
+        filt.addWidget(void_btn)
+        layout.addLayout(filt)
+
+        # Summary strip
+        self.summary_lbl = QLabel("0 Invoices")
+        self.summary_lbl.setStyleSheet("font-weight: 700; color: #2b6cb0; padding: 4px 0;")
+        layout.addWidget(self.summary_lbl)
+
+        # Invoices table
+        self.table = QTableWidget(0, 11)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Invoice #",
+                "Customer",
+                "Date",
+                "Due Date",
+                "Status",
+                "Ccy",
+                "Total",
+                "Paid",
+                "Balance Due",
+                "Home Total",
+                "Memo",
+            ]
+        )
+        style_table_defaults(self.table)
+        self.table.cellDoubleClicked.connect(lambda _r, _c: self._view_selected())
+        layout.addWidget(self.table)
+
+    def refresh(self) -> None:
+        prev_cust_id = self.customer_combo.currentData()
+        self.customer_combo.blockSignals(True)
+        self.customer_combo.clear()
+        self.customer_combo.addItem("All Customers", None)
+        for c in self.engine.list_customers():
+            self.customer_combo.addItem(f"{c['name']} ({c['currency_code']})", c["id"])
+        if prev_cust_id is not None:
+            idx = self.customer_combo.findData(prev_cust_id)
+            if idx >= 0:
+                self.customer_combo.setCurrentIndex(idx)
+        self.customer_combo.blockSignals(False)
+        self._load_invoices()
+
+    def _load_invoices(self) -> None:
+        home = self.engine.get_home_currency()
+        cust_id = self.customer_combo.currentData()
+        status = self.status_combo.currentText()
+        include_voided = status in ("All", "Void")
+
+        self._invoices = self.engine.list_customer_invoices(
+            customer_id=cust_id,
+            status_filter=status,
+            include_voided=include_voided,
+        )
+        self.table.setRowCount(len(self._invoices))
+
+        tot_home = 0
+        open_home = 0
+        for idx, inv in enumerate(self._invoices):
+            ccy = inv["currency_code"]
+            if not inv["voided"]:
+                tot_home += int(inv["total_home"])
+                open_home += int(inv["open_home"])
+            self.table.setItem(idx, 0, make_readonly_item(inv["txn_number"]))
+            self.table.setItem(idx, 1, make_readonly_item(inv["customer_name"]))
+            self.table.setItem(idx, 2, make_readonly_item(inv["txn_date"]))
+            self.table.setItem(idx, 3, make_readonly_item(inv["due_date"] or ""))
+            self.table.setItem(idx, 4, make_readonly_item(inv["status"]))
+            self.table.setItem(idx, 5, make_readonly_item(ccy))
+            self.table.setItem(idx, 6, make_readonly_item(format_money(inv["total_foreign"], ccy), align_right=True))
+            self.table.setItem(idx, 7, make_readonly_item(format_money(inv["paid_foreign"], ccy), align_right=True))
+            self.table.setItem(idx, 8, make_readonly_item(format_money(inv["open_foreign"], ccy), align_right=True))
+            self.table.setItem(idx, 9, make_readonly_item(format_money(inv["total_home"], home), align_right=True))
+            self.table.setItem(idx, 10, make_readonly_item(inv["memo"] or ""))
+
+        self.table.resizeColumnsToContents()
+        self.summary_lbl.setText(
+            f"{len(self._invoices)} Invoice(s)  |  "
+            f"Total Invoiced ({home}): {format_money(tot_home, home)}  |  "
+            f"Open Balance ({home}): {format_money(open_home, home)}   "
+            f"(Double-click any invoice to inspect line items & export PDF)"
+        )
+
+    def _view_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._invoices):
+            show_error(self, "Select Invoice", "Please select an invoice first.")
+            return
+        dlg = InvoiceDetailDialog(self.engine, self._invoices[row]["id"], parent=self)
+        dlg.exec()
+
+    def _void_selected(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._invoices):
+            return
+        inv = self._invoices[row]
+        try:
+            self.engine.void_transaction(inv["id"])
+            show_info(self, "Voided", f"Invoice {inv['txn_number']} has been voided.")
+            self.refresh()
+            self.on_data_changed()
+        except Exception as exc:
+            show_error(self, "Void Error", str(exc))
 
 
 class CustomerDialog(QDialog):
@@ -182,6 +485,16 @@ class CustomerCenterView(QWidget):
         self.detail_lbl.setStyleSheet("font-weight: 700; color: #1a365d;")
         rtop.addWidget(self.detail_lbl)
         rtop.addStretch()
+
+        self.txn_filter_combo = QComboBox()
+        self.txn_filter_combo.addItems(["All Transactions", "Invoices Only", "Payments Only"])
+        self.txn_filter_combo.currentIndexChanged.connect(self._on_customer_selected)
+        rtop.addWidget(self.txn_filter_combo)
+
+        view_inv_btn = QPushButton("View Invoice")
+        view_inv_btn.clicked.connect(self._view_selected_invoice)
+        rtop.addWidget(view_inv_btn)
+
         void_btn = QPushButton("Void Selected Txn")
         void_btn.clicked.connect(self._void_selected_txn)
         rtop.addWidget(void_btn)
@@ -192,6 +505,7 @@ class CustomerCenterView(QWidget):
             ["Date", "Type", "Number", "Status", "Ccy", "Foreign Total", "Home Total", "Memo"]
         )
         style_table_defaults(self.txn_table)
+        self.txn_table.cellDoubleClicked.connect(lambda _r, _c: self._view_selected_invoice())
         rl.addWidget(self.txn_table)
         splitter.addWidget(right)
         splitter.setSizes([360, 640])
@@ -216,14 +530,20 @@ class CustomerCenterView(QWidget):
     def _on_customer_selected(self) -> None:
         home = self.engine.get_home_currency()
         row = self.cust_table.currentRow()
+        filt = self.txn_filter_combo.currentText() if hasattr(self, "txn_filter_combo") else "All Transactions"
+        if filt == "Invoices Only":
+            types: tuple[str, ...] = ("Invoice",)
+        elif filt == "Payments Only":
+            types = ("Payment",)
+        else:
+            types = ("Invoice", "Payment", "SalesReceipt")
+
         if row < 0 or row >= len(self._customers):
-            self._txns = self.engine.list_transactions(txn_types=("Invoice", "Payment", "SalesReceipt"))
-            self.detail_lbl.setText("All Customer Transactions")
+            self._txns = self.engine.list_transactions(txn_types=types)
+            self.detail_lbl.setText(f"All Customers — {filt}")
         else:
             c = self._customers[row]
-            self._txns = self.engine.list_transactions(
-                txn_types=("Invoice", "Payment", "SalesReceipt"), entity_id=c["id"]
-            )
+            self._txns = self.engine.list_transactions(txn_types=types, entity_id=c["id"])
             self.detail_lbl.setText(f"{c['name']} ({c['currency_code']}) — {c['email']} | {c['terms']}")
 
         self.txn_table.setRowCount(len(self._txns))
@@ -255,6 +575,17 @@ class CustomerCenterView(QWidget):
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.refresh()
                 self.on_data_changed()
+
+    def _view_selected_invoice(self) -> None:
+        row = self.txn_table.currentRow()
+        if row < 0 or row >= len(self._txns):
+            return
+        txn = self._txns[row]
+        if txn["txn_type"] != "Invoice":
+            show_info(self, "Not an Invoice", "Select an Invoice row to inspect its line items and PDF.")
+            return
+        dlg = InvoiceDetailDialog(self.engine, txn["id"], parent=self)
+        dlg.exec()
 
     def _void_selected_txn(self) -> None:
         row = self.txn_table.currentRow()

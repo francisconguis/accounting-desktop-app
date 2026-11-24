@@ -250,3 +250,50 @@ def test_bank_reconciliation(engine: AccountingEngine):
     state_after = engine.get_reconciliation_state(checking["id"])
     assert state_after["beginning_balance_home"] == 250_000
     assert len(state_after["uncleared_lines"]) == 0
+
+
+def test_list_customer_invoices_and_details(engine: AccountingEngine):
+    cust_a = engine.create_customer("Alpha Corp", currency_code="USD")
+    cust_b = engine.create_customer("Beta GmbH", currency_code="EUR")
+    srv = engine.create_item(sku="SRV-10", name="Design", item_type="Service", sales_price=50_000)
+
+    inv1 = engine.create_invoice(
+        customer_id=cust_a,
+        txn_date="2026-04-01",
+        due_date="2026-05-01",
+        lines=[InvoiceLineInput(item_id=srv, description="Phase 1", quantity=2, rate_foreign=50_000)],
+    )
+    inv2 = engine.create_invoice(
+        customer_id=cust_a,
+        txn_date="2026-04-05",
+        due_date="2026-05-05",
+        lines=[InvoiceLineInput(item_id=srv, description="Phase 2", quantity=1, rate_foreign=50_000)],
+    )
+    engine.create_invoice(
+        customer_id=cust_b,
+        txn_date="2026-04-06",
+        due_date="2026-05-06",
+        currency_code="EUR",
+        exchange_rate_micros=1_100_000,
+        lines=[InvoiceLineInput(item_id=srv, description="EU Phase", quantity=1, rate_foreign=40_000)],
+    )
+    # Pay inv1 partially ($400 of $1,000)
+    engine.receive_payment(
+        customer_id=cust_a,
+        txn_date="2026-04-10",
+        applications=[(inv1, 40_000)],
+    )
+
+    alpha_invs = engine.list_customer_invoices(customer_id=cust_a)
+    assert len(alpha_invs) == 2
+    by_id = {i["id"]: i for i in alpha_invs}
+    assert by_id[inv1]["status"] == "Partial"
+    assert by_id[inv1]["paid_foreign"] == 40_000
+    assert by_id[inv1]["open_foreign"] == 60_000
+    assert by_id[inv2]["status"] == "Open"
+
+    details = engine.get_invoice_details(inv1)
+    assert len(details["lines"]) == 1
+    assert len(details["payments"]) == 1
+    assert details["open_foreign"] == 60_000
+

@@ -31,7 +31,12 @@ from accounting.sample_data import load_sample_company
 from ui.banking_views import BankReconciliationView, MakeDepositsView
 from ui.chart_of_accounts import AccountRegisterView, ChartOfAccountsView
 from ui.currency_manager import CurrencyManagerView
-from ui.customer_center import CreateInvoiceView, CustomerCenterView, ReceivePaymentsView
+from ui.customer_center import (
+    CreateInvoiceView,
+    CustomerCenterView,
+    CustomerInvoicesView,
+    ReceivePaymentsView,
+)
 from ui.home_dashboard import HomeDashboardView
 from ui.inventory_center import InventoryCenterView
 from ui.journal_entry_view import JournalEntryView
@@ -127,6 +132,7 @@ class MainWindow(QMainWindow):
         # Customers menu
         cust_m = mb.addMenu("C&ustomers")
         self._add_menu_action(cust_m, "Customer Center", lambda: self.open_workspace("customers"))
+        self._add_menu_action(cust_m, "Customer Invoices List", lambda: self.open_workspace("customer_invoices"))
         self._add_menu_action(cust_m, "Create Invoices", lambda: self.open_workspace("create_invoice"))
         self._add_menu_action(cust_m, "Receive Payments", lambda: self.open_workspace("receive_payments"))
 
@@ -181,6 +187,7 @@ class MainWindow(QMainWindow):
             ("📚  Chart of Accounts", "coa"),
             ("📦  Items & Inventory", "inventory"),
             ("👥  Customers", "customers"),
+            ("📋  Customer Invoices", "customer_invoices"),
             ("🧾  Create Invoice", "create_invoice"),
             ("💰  Receive Payments", "receive_payments"),
             ("🏢  Vendors", "vendors"),
@@ -264,6 +271,7 @@ class MainWindow(QMainWindow):
             "currencies": ("Currency List", lambda: CurrencyManagerView(self.engine, self._broadcast_refresh)),
             "inventory": ("Items & Inventory", lambda: InventoryCenterView(self.engine, self._broadcast_refresh)),
             "customers": ("Customer Center", lambda: CustomerCenterView(self.engine, self.open_workspace, self._broadcast_refresh)),
+            "customer_invoices": ("Customer Invoices", lambda: CustomerInvoicesView(self.engine, self.open_workspace, self._broadcast_refresh)),
             "create_invoice": ("Create Invoice", lambda: CreateInvoiceView(self.engine, self._broadcast_refresh)),
             "receive_payments": ("Receive Payments", lambda: ReceivePaymentsView(self.engine, self._broadcast_refresh)),
             "vendors": ("Vendor Center", lambda: VendorCenterView(self.engine, self.open_workspace, self._broadcast_refresh)),

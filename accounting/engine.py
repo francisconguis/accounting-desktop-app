@@ -1279,6 +1279,120 @@ class AccountingEngine:
                 out.append(d)
         return out
 
+    def list_customer_invoices(
+        self,
+        customer_id: Optional[int] = None,
+        status_filter: Optional[str] = None,
+        include_voided: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return all invoices for a specific customer (or all customers) with paid/open amounts."""
+        clauses = ["t.txn_type = 'Invoice'"]
+        params: list[Any] = []
+        if not include_voided:
+            clauses.append("t.voided = 0")
+        if customer_id is not None:
+            clauses.append("t.entity_id = ?")
+            params.append(customer_id)
+        if status_filter and status_filter != "All":
+            clauses.append("t.status = ?")
+            params.append(status_filter)
+        where_sql = " AND ".join(clauses)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                t.*,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                COALESCE((
+                    SELECT SUM(pa.applied_foreign)
+                    FROM payment_applications pa
+                    JOIN transactions pt ON pt.id = pa.payment_txn_id
+                    WHERE pa.target_txn_id = t.id AND pt.voided = 0
+                ), 0) AS paid_foreign,
+                COALESCE((
+                    SELECT SUM(pa.target_home_amount)
+                    FROM payment_applications pa
+                    JOIN transactions pt ON pt.id = pa.payment_txn_id
+                    WHERE pa.target_txn_id = t.id AND pt.voided = 0
+                ), 0) AS cleared_home,
+                (SELECT COUNT(*) FROM transaction_lines tl WHERE tl.transaction_id = t.id) AS line_count
+            FROM transactions t
+            JOIN customers c ON c.id = t.entity_id
+            WHERE {where_sql}
+            ORDER BY t.txn_date DESC, t.id DESC
+            """,
+            params,
+        ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if d["voided"]:
+                d["open_foreign"] = 0
+                d["open_home"] = 0
+            else:
+                d["open_foreign"] = int(d["total_foreign"]) - int(d["paid_foreign"])
+                d["open_home"] = int(d["total_home"]) - int(d["cleared_home"])
+            out.append(d)
+        return out
+
+    def get_invoice_details(self, invoice_txn_id: int) -> dict[str, Any]:
+        """Return full invoice header, customer info, line items, applied payments, and FIFO COGS."""
+        inv_row = self.conn.execute(
+            """
+            SELECT t.*, c.name AS customer_name, c.company_name AS customer_company,
+                   c.email AS customer_email, c.billing_address AS customer_address,
+                   c.terms AS customer_terms
+            FROM transactions t
+            JOIN customers c ON c.id = t.entity_id
+            WHERE t.id = ? AND t.txn_type = 'Invoice'
+            """,
+            (invoice_txn_id,),
+        ).fetchone()
+        if inv_row is None:
+            raise AccountingError(f"Invoice ID {invoice_txn_id} not found.")
+        inv = dict(inv_row)
+
+        line_rows = self.conn.execute(
+            """
+            SELECT tl.*, i.sku AS item_sku, i.name AS item_name, i.type AS item_type
+            FROM transaction_lines tl
+            LEFT JOIN items i ON i.id = tl.item_id
+            WHERE tl.transaction_id = ?
+            ORDER BY tl.id ASC
+            """,
+            (invoice_txn_id,),
+        ).fetchall()
+
+        pay_rows = self.conn.execute(
+            """
+            SELECT pa.*, pt.txn_number AS payment_number, pt.txn_date AS payment_date,
+                   pt.exchange_rate_micros AS payment_rate_micros, pt.memo AS payment_memo
+            FROM payment_applications pa
+            JOIN transactions pt ON pt.id = pa.payment_txn_id
+            WHERE pa.target_txn_id = ? AND pt.voided = 0
+            ORDER BY pt.txn_date ASC, pt.id ASC
+            """,
+            (invoice_txn_id,),
+        ).fetchall()
+
+        cogs_row = self.conn.execute(
+            "SELECT COALESCE(SUM(total_cost_home), 0) AS cogs FROM fifo_consumptions WHERE sale_txn_id = ?",
+            (invoice_txn_id,),
+        ).fetchone()
+
+        paid_foreign = sum(int(p["applied_foreign"]) for p in pay_rows)
+        cleared_home = sum(int(p["target_home_amount"]) for p in pay_rows)
+        inv["paid_foreign"] = paid_foreign
+        inv["cleared_home"] = cleared_home
+        inv["open_foreign"] = 0 if inv["voided"] else int(inv["total_foreign"]) - paid_foreign
+        inv["open_home"] = 0 if inv["voided"] else int(inv["total_home"]) - cleared_home
+        inv["lines"] = [dict(r) for r in line_rows]
+        inv["payments"] = [dict(r) for r in pay_rows]
+        inv["fifo_cogs_home"] = int(cogs_row["cogs"])
+        return inv
+
     def receive_payment(
         self,
         customer_id: int,
