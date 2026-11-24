@@ -1,0 +1,23 @@
+# Python virtual environment & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local SQLite company files & backups (do not commit financial data)
+*.db
+*.db-wal
+*.db-shm
+*.qbw
+
+# Exported reports
+*.pdf
+*.csv
+*.xlsx
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
